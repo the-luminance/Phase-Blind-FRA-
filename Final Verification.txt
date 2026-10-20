@@ -1,0 +1,81 @@
+clc; clear; close all;
+fprintf('== EXECUTING FINAL CIRCUIT NETWORK VERIFICATION ==\n');
+
+%% STEP 1: Load the Upstream Identification Model for Validation Base
+if ~exist('aaa_identified_model.mat','file')
+    error('Missing aaa_identified_model.mat. Run Script 6 first.');
+end
+
+load('aaa_identified_model.mat','freq_real','w_real','mag_real_dB','zer','pol','K_fit');
+s = 1j * w_real;
+
+%% STEP 2: Input Your Synthesized Positive Component Parameters
+% Primary input series line resistance
+R0 = 1.758482e+03;
+
+% Parallel Branches 1-4 and 6-25 mapped as physical Series R-L structures
+% Column 1: Resistance (Ohms) | Column 2: Inductance (Henries)
+RL_branches = [
+    8.770252e-02, 2.815138e-06; % Branch 1
+    4.156698e-02, 1.357460e-06; % Branch 2
+    2.648324e-01, 2.673040e-05; % Branch 3
+    3.908487e-02, 4.314051e-06; % Branch 4
+    2.024195e-01, 3.739315e-05; % Branch 6
+    1.239352e-02, 2.545792e-06; % Branch 7
+    6.640933e-02, 1.965349e-05; % Branch 8
+    6.868792e-03, 2.199089e-06; % Branch 9
+    3.813199e-02, 1.728151e-05; % Branch 10
+    4.575754e-03, 2.171972e-06; % Branch 11
+    2.642705e-02, 1.819303e-05; % Branch 12
+    3.018992e-03, 2.098090e-06; % Branch 13
+    1.885947e-03, 1.934239e-06; % Branch 14
+    2.000693e-02, 2.127136e-05; % Branch 15
+    1.055637e-03, 1.640827e-06; % Branch 16
+    1.494054e-02, 2.560414e-05; % Branch 17
+    4.589775e-04, 1.131450e-06; % Branch 18
+    9.237893e-03, 2.785522e-05; % Branch 19
+    3.191161e-04, 1.193902e-06; % Branch 20
+    3.718187e-04, 1.980152e-06; % Branch 21
+    4.793005e-03, 3.161188e-05; % Branch 22
+    8.850629e-04, 1.100825e-05; % Branch 23
+    5.272112e-04, 1.678250e-05; % Branch 24
+    1.959303e-04, 9.471315e-06  % Branch 25
+];
+
+% Crown Jewel: Branch 5 (The Winding Cavity Resonance Mode)
+R5 = 3.210523e-03; % Series Resistance (Ohms)
+L5 = 2.557254e-07; % Series Inductance (Henries)
+C5 = 5.858163e-02; % Series Capacitance (Farads)
+
+%% STEP 3: Compute the Network Admittance Rail
+Y_parallel_total = zeros(size(s));
+
+% 3a. Accumulate all parallel entries for the series R-L loss modes
+% Admittance formula per branch: Y = 1 / (R + sL)
+for b = 1:size(RL_branches, 1)
+    Rb = RL_branches(b, 1);
+    Lb = RL_branches(b, 2);
+    Y_parallel_total = Y_parallel_total + 1 ./ (Rb + s .* Lb);
+end
+
+% 3b. Accumulate the admittance of the series R-L-C resonant block (Branch 5)
+% Admittance formula: Y = sC / (s^2 * L * C + s * R * C + 1)
+Y_5 = (s .* C5) ./ (s.^2 .* L5 .* C5 + s .* R5 .* C5 + 1);
+Y_parallel_total = Y_parallel_total + Y_5;
+
+%% STEP 4: Close the Circuit Loop via Series Element R0
+% Z_total = R0 + Z_parallel = R0 + 1 / Y_parallel_total
+Z_total = R0 + 1 ./ (Y_parallel_total + 1e-300);
+
+% Evaluate your final synthesized network magnitude profile in dB
+mag_rebuilt_dB = 20*log10(abs(Z_total) + 1e-300);
+
+%% STEP 5: Mathematical Cross-Check Verification against ZPK Target
+log_abs_basis = zeros(size(s));
+for i = 1:length(zer)
+    log_abs_basis = log_abs_basis + log(abs(s - zer(i)) + 1e-300); 
+end
+for i = 1:length(pol)
+    log_abs_basis = log_abs_basis - log(abs(s - pol(i)) + 1e-300); 
+end
+% ... [Further verification code]

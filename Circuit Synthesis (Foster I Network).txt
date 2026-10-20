@@ -1,0 +1,101 @@
+if ~exist('zer','var') || ~exist('pol','var') || ~exist('K_fit','var')
+    error('Need zer, pol, and K_fit in workspace.');
+end
+
+%% STEP 1: Build proper transfer function
+sys_zkp = zpk(zer, pol, K_fit);
+[num, den] = tfdata(sys_zkp, 'v');
+
+%% STEP 2: Check positive-real condition
+w_check = logspace(log10(0.1), log10(1e7), 10000);
+H_check = freqs(num, den, w_check);
+min_re = min(real(H_check));
+fprintf('Minimum Re[H(jw)] = %.4e\n', min_re);
+
+if min_re < -1e-6
+    fprintf('H(s) is NOT positive-real (min Re = %.3e)\n', min_re);
+    fprintf('Running PR enforcement (reflection of non-PR residues)...\n');
+    [num, den] = enforce_positive_real(num, den);
+    H_check2 = freqs(num, den, w_check);
+    fprintf('After enforcement: min Re[H(jw)] = %.4e\n', min(real(H_check2)));
+end
+
+%% STEP 3: Partial fraction expansion
+[r, p, k_direct] = residue(num, den);
+
+%% STEP 4: Synthesize Foster I Network
+i = 1;
+branch = 1;
+while i <= length(p)
+    if imag(p(i)) == 0
+        % --- PURELY REAL POLE: Series R-C Admittance Branch
+        % ... [Real pole extraction and PR check]
+        
+        if R_val < 1e-15
+            R_val = 1e-15;
+        end
+        if C_val < 1e-15
+            C_val = 1e-15;
+        end
+        
+        % Re-project the pole position to maintain the structural time constant
+        pp_pure = -1 / (R_val * C_val);
+        fprintf('Branch %2d (Real, PR-Projected): R = %.6e Ω, C = %.6e F\n', branch, R_val, C_val);
+    else
+        % Purely passive branch directly from the unconstrained fit
+        R_val = R_raw;
+        C_val = C_raw;
+        fprintf('Branch %2d (Real RC): R = %.6e Ω, C = %.6e F\n', branch, R_val, C_val);
+    end
+    i = i + 1;
+    
+elseif imag(p(i)) > 0
+    % --- COMPLEX CONJUGATE PAIR: Series R-L-C Admittance Branch
+    rr = r(i);
+    pp = p(i);
+    alpha = -real(pp); % Damping factor (positive for stable systems)
+    omega = imag(pp);  % Damped natural frequency
+    omega_n2 = alpha^2 + omega^2;
+    
+    % Exact expansion coefficients
+    A = 2 * real(rr);
+    B = -2 * (real(rr)*real(pp) - imag(rr)*imag(pp));
+    
+    % Calculate exact series R-L-C branch elements
+    L_val = 1 / A;
+    C_val = A^2 / (B*A - 2*alpha*A);
+    R_val = (B/A - 2*alpha) * L_val;
+    
+    % Fallback optimization if residue phase causes negative elements
+    if L_val < 0 || C_val < 0 || R_val < 0
+        % Passivity Correction Matrix: Project residue onto the positive-real plane
+        A = 2 * abs(real(rr));
+        B = 2 * abs(real(rr)*alpha);
+        L_val = 1 / A;
+        C_val = A / omega_n2;
+        R_val = 2 * alpha * L_val;
+        fprintf('Branch %2d (Complex, PR-Projected): R = %6e Ω, L = %6e H, C = %6e F\n', branch, R_val, L_val, C_val);
+    else
+        f_res = sqrt(omega_n2) / (2 * pi);
+        Q_val = sqrt(omega_n2) / (2 * alpha);
+        fprintf('Branch %2d (Complex RLC): R = %6e Ω, L = %6e H, C = %6e F [f_res=%.1f Hz, Q=%.1f]\n', branch, R_val, L_val, C_val, f_res, Q_val);
+    end
+    i = i + 2;
+else
+    i = i + 1;
+end
+end
+
+%% HELPER: enforce_positive_real
+function [num_pr, den_pr] = enforce_positive_real(num_in, den_in)
+    [r, p, k] = residue(num_in, den_in);
+    r_pr = r;
+    for ii = 1:length(r)
+        if real(r_pr(ii)) < 0
+            r_pr(ii) = abs(real(r_pr(ii))) + 1j*imag(r_pr(ii));
+        end
+    end
+    [num_pr, den_pr] = residue(r_pr, p, k);
+    num_pr = real(num_pr);
+    den_pr = real(den_pr);
+end

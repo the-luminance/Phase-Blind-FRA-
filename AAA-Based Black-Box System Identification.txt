@@ -1,0 +1,293 @@
+clc; clear; close all;
+fprintf('=== AAA-BASED BLACK-BOX SYSTEM IDENTIFICATION ===\n');
+
+%% STEP 1: Load real data
+data = readmatrix('best_filtered4.csv');
+freq_real = data(:, 1);
+mag_raw = data(:, 2);
+
+pata = readmatrix('multi_line_data2.csv');
+freq_real1 = pata(:, 1);
+mag_raw1 = pata(:, 2);
+
+% Data is in dB - the artifact was a fitting-weighting problem, not a units problem
+is_data_in_dB = true;
+
+valid_idx = freq_real > 0;
+freq_real = freq_real(valid_idx);
+mag_raw = mag_raw(valid_idx);
+[freq_real, unique_idx] = unique(freq_real, 'stable');
+mag_raw = mag_raw(unique_idx);
+
+if is_data_in_dB
+    mag_real_dB = mag_raw;
+    mag_real_dB1 = mag_raw1;
+    mag_real_lin = 10.^(mag_real_dB / 20);
+    mag_real_lin1 = 10.^(mag_real_dB1 / 20);
+else
+    mag_real_lin = mag_raw;
+    mag_real_lin1 = mag_raw1;
+    mag_real_dB = 20 * log10(mag_raw + 1e-12);
+end
+
+w_real = 2 * pi * freq_real;
+
+%% STEP 1c: Sanity check
+figure('Position', [50 50 800 350]);
+semilogx(freq_real, mag_real_lin, 'b-', 'LineWidth', 1.3); hold on;
+semilogx(freq_real1, mag_real_lin1, 'g-', 'LineWidth', 1.3);
+xlabel('Frequency (Hz)'); ylabel('Magnitude (linear)');
+legend('best_filtered4.csv', 'multi_line_data2.csv', 'Location', 'best');
+title('Raw input sanity check: do both files agree, pre-fitting?');
+grid on;
+
+%% STEP 1b: Light pre-smoothing of log-magnitude
+smooth_window = 3;
+if smooth_window > 1
+    mag_real_dB_smooth = movmean(mag_real_dB, smooth_window);
+else
+    mag_real_dB_smooth = mag_real_dB;
+end
+mag_real_lin_smooth = 10.^(mag_real_dB_smooth / 20);
+
+%% STEP 2: Reconstruct minimum-phase complex response via Hilbert transform
+f_log = log10(freq_real);
+N_uniform = 4096;
+logf_u = linspace(f_log(1), f_log(end), N_uniform);
+log_mag = log(mag_real_lin_smooth + 1e-12);
+log_mag_u = interp1(f_log, log_mag, logf_u, 'pchip');
+
+pad_frac = 0.15;
+n_pad = round(pad_frac * N_uniform);
+log_mag_padded = [repmat(log_mag_u(1), n_pad, 1); log_mag_u; repmat(log_mag_u(end), n_pad, 1)];
+phase_padded = -imag(hilbert(log_mag_padded));
+phase_u = phase_padded(n_pad+1 : n_pad+N_uniform);
+phase_real = interp1(logf_u, phase_u, f_log, 'pchip');
+
+H_complex = mag_real_lin_smooth .* exp(1j * phase_real);
+
+%% STEP 3: Frequency normalization
+w_max = max(w_real);
+use_mirroring = false;
+if use_mirroring
+    w_fit = [w_real; -w_real];
+    H_fit = [H_complex; conj(H_complex)];
+else
+    w_fit = w_real;
+    H_fit = H_complex;
+end
+
+s_norm = 1j * w_fit / w_max;
+
+%% STEP 3b: NEW -- relative-error weights for AAA
+% weight = 1/|H| makes AAA minimize RELATIVE error (dB-consistent)
+% Clipped at 2% of the noise floor so AAA doesn't chase noise at deep anti-resonance
+noise_floor_dB = 45; % set to your analyzer's actual SNR
+peak_mag = max(abs(H_fit));
+floor_mag = peak_mag * 10^(noise_floor_dB/20);
+aaa_weights = 1 ./ max(abs(H_fit), floor_mag);
+
+%% STEP 4: Run AAA
+fprintf('Running AAA rational approximation (relative-error weighted, adaptive order)...\n');
+tol_aaa = 10^(noise_floor_dB/20);
+mmax_aaa = 150;
+[r, pol_n, res_n, zer_n, z_supp, f_supp, w_bary, ervec] = ...
+    aaa(H_fit, s_norm, 'tol', tol_aaa, 'mmax', mmax_aaa, 'weights', aaa_weights);
+
+order_found = length(pol_n);
+final_rel_err = ervec(end)/norm(aaa_weights.*H_fit, inf);
+fprintf('AAA converged with %d poles (order found automatically, tol=%.1e).\n', order_found, tol_aaa);
+fprintf('Final max weighted-relative error: %.3e\n', final_rel_err);
+
+%% STEP 4a: Explicit convergence check
+hit_cap = (length(ervec) == mmax_aaa) && (final_rel_err > tol_aaa);
+if hit_cap
+    fprintf('\n*** WARNING: AAA did NOT converge - it hit mmax_aaa (%d) before reaching tol (%.1e). The model below is UNDER-FIT. Increase mmax_aaa and re-run before trusting this result. ***\n\n', mmax_aaa, tol_aaa);
+else
+    fprintf('Convergence check: AAA reached tolerance before hitting mmax. Good.\n\n');
+end
+
+%% STEP 4b: Knee-detection cross-check
+log_err = log10(ervec(:));
+n_iter = length(log_err);
+if n_iter >= 3
+    x1 = 1; y1 = log_err(1);
+    x2 = n_iter; y2 = log_err(end);
+    line_len = sqrt((x2-x1)^2 + (y2-y1)^2);
+    idx_range = (1:n_iter)';
+    dist = abs((y2-y1)*idx_range - (x2-x1)*log_err + x2*y1 - y2*x1) / line_len;
+    [~, suggested_order] = max(dist);
+    fprintf('Knee-detection suggests order = %d (compare against visual count).\n', suggested_order);
+else
+    suggested_order = order_found;
+end
+
+%% STEP 5: De-normalize poles/zeros back to physical s-domain
+pol = pol_n * w_max;
+zer = zer_n * w_max;
+
+%% STEP 5b: Remove numerical eigenvalue-extraction artifacts
+spurious_cutoff = 50 * w_max;
+n_spurious_pol = sum(abs(pol) > spurious_cutoff);
+n_spurious_zer = sum(abs(zer) > spurious_cutoff);
+pol(abs(pol) > spurious_cutoff) = [];
+zer(abs(zer) > spurious_cutoff) = [];
+if n_spurious_pol > 0 || n_spurious_zer > 0
+    fprintf('Removed %d spurious-magnitude pole(s), %d spurious-magnitude zero(s).\n', n_spurious_pol, n_spurious_zer);
+end
+
+%% STEP 5c: Remove Froissart doublets (near-cancelling pole/zero pairs)
+[pol, zer, n_doublets] = remove_froissart_doublets(pol, zer, 1e-3);
+if n_doublets > 0
+    fprintf('Removed %d Froissart doublets(s) (near-cancelling pole/zero artifact pairs).\n', n_doublets);
+end
+fprintf('Surviving model: %d poles, %d zeros after artifact cleanup.\n', length(pol), length(zer));
+
+%% STEP 6: Enforce stability + minimum phase via EXACT magnitude-preserving reflection
+n_flipped_poles = sum(real(pol) > 0);
+n_flipped_zeros = sum(real(zer) > 0);
+pol(real(pol) > 0) = -real(pol(real(pol) > 0)) + 1j*imag(pol(real(pol) > 0));
+zer(real(zer) > 0) = -real(zer(real(zer) > 0)) + 1j*imag(zer(real(zer) > 0));
+
+if n_flipped_poles > 0 || n_flipped_zeros > 0
+    fprintf('Stability/min-phase enforcement: flipped %d unstable pole(s), %d non-min-phase zero(s).\n', n_flipped_poles, n_flipped_zeros);
+end
+
+%% STEP 7: Reconstruct magnitude in product (zero-pole-gain) form
+s = 1j * w_real;
+log_abs_basis = zeros(size(s));
+for i = 1:length(zer)
+    log_abs_basis = log_abs_basis + log(abs(s - zer(i)) + 1e-300);
+end
+for i = 1:length(pol)
+    log_abs_basis = log_abs_basis - log(abs(s - pol(i)) + 1e-300);
+end
+
+log_ratio = log(abs(H_complex) + 1e-300) - log_abs_basis;
+log_K = median(log_ratio);
+K_fit = exp(log_K);
+
+log_mag_fit = log_K + log_abs_basis;
+mag_fit_dB = log_mag_fit * (20 / log(10));
+mag_fit_lin = exp(log_mag_fit);
+
+%% STEP 8: Fit-error reporting
+db_error = mag_real_dB - mag_fit_dB;
+fprintf('\nLog-magnitude fit error: mean=%.2f dB | max=%.2f dB | RMS=%.2f dB\n', ...
+    mean(abs(db_error)), max(abs(db_error)), sqrt(mean(db_error.^2)));
+fprintf('Final order (poles): %d | Zeros: %d\n', length(pol), length(zer));
+
+%% STEP 9: Visualization
+figure('Position', [150 150 1100 800]);
+subplot(2, 2, [1 2]);
+plot(freq_real, mag_real_lin, 'b-', 'LineWidth', 1.5); hold on;
+plot(freq_real, mag_fit_lin, 'r-', 'LineWidth', 2.0);
+xlabel('Frequency (Hz)');
+ylabel('Magnitude (linear)');
+legend('Measured (best_filtered4.csv)', 'AAA Fit', 'Location', 'best');
+title_str = sprintf('AAA Identification | Order %d, Zeros %d | RMS err: %.2f dB', ...
+    length(pol), length(zer), sqrt(mean(db_error.^2)));
+if hit_cap
+    title_str = [title_str ' | DID NOT CONVERGE'];
+end
+title(title_str);
+grid on;
+
+subplot(2, 2, 3);
+plot(real(pol), imag(pol), 'rx', 'MarkerSize', 10, 'LineWidth', 2); hold on;
+plot(real(zer), imag(zer), 'bo', 'MarkerSize', 8, 'LineWidth', 1.5);
+xline(0, 'k--', 'LineWidth', 1.5);
+xlabel('Real Axis (\sigma)'); ylabel('Imag Axis (\theta)');
+legend('Poles', 'Zeros', 'Stability Boundary', 'Location', 'best');
+title('Pole-Zero Map (AAA, stabilized)');
+grid on;
+
+subplot(2, 2, 4);
+semilogy(1:length(ervec), ervec, 'o--', 'LineWidth', 1.5); hold on;
+semilogy(suggested_order, ervec(suggested_order), 'r*', 'MarkerSize', 14, 'LineWidth', 2);
+yline(tol_aaa * norm(aaa_weights .* H_fit, inf), 'k--', 'LineWidth', 1.2);
+legend('Weighted error per iteration', sprintf('Suggested knee (order %d)', suggested_order), ...
+    'Convergence target', 'Location', 'best');
+xlabel('AAA iteration (= number of support points added)');
+ylabel('Max weighted error (log scale)');
+title('Order-selection curve');
+grid on;
+sgtitle('AAA-Based Identification (Relative-Error Weighted)');
+fprintf('\n== AAA PIPELINE COMPLETE ==\n');
+
+%% STEP 10: Save identified model for downstream use
+save('aaa_identified_model.mat', 'pol', 'zer', 'K_fit', ...
+    'freq_real', 'w_real', 'mag_real_dB', 'mag_real_lin', ...
+    'order_found', 'suggested_order', 'hit_cap');
+fprintf('\nSaved aaa_identified_model.mat (poles, zeros, gain, validation data).\n');
+
+%% ==============================================================
+%% HELPER: remove_froissart_doublets
+%% ==============================================================
+function [pol_clean, zer_clean, n_removed] = remove_froissart_doublets(pol, zer, rel_tol)
+    if nargin < 3
+        rel_tol = 1e-3;
+    end
+    pol_clean = pol(:);
+    zer_clean = zer(:);
+    n_removed = 0;
+    % ... [Doublet removal logic]
+end
+
+%% ==============================================================
+%% HELPER: AAA Algorithm
+%% ==============================================================
+function [r, pol, res, zer, z, f, w, ervec] = aaa(F, Z, varargin)
+    p = inputParser;
+    addParameter(p, 'tol', 1e-13);
+    addParameter(p, 'mmax', 100);
+    addParameter(p, 'weights', []);
+    parse(p, varargin{:});
+    tol = p.Results.tol;
+    mmax = p.Results.mmax;
+    wts = p.Results.weights;
+    
+    Z = Z(:);
+    F = F(:);
+    M = length(Z);
+    if isempty(wts)
+        wts = ones(M, 1); % backward-compatible: standard absolute-error AAA
+    end
+    
+    % ... [Core AAA iteration logic]
+    
+    % Poles: generalized eigenvalues of an (m+1)x(m+1) pencil
+    B = eye(m + 1);
+    B(1, 1) = 0;
+    E = [0, w.'; ones(m, 1), diag(z)];
+    pol_all = eig(E, B);
+    pol = pol_all(~isinf(pol_all));
+    
+    % Zeros: same pencil construction with f-weighted entries
+    E = [0, (w .* f).'; ones(m, 1), diag(z)];
+    zer_all = eig(E, B);
+    zer = zer_all(~isinf(zer_all));
+    
+    % Residues at the poles (numeric, via the barycentric derivative formula)
+    C_pol = 1 ./ bsxfun(@minus, pol, z.');
+    N_pol = C_pol * (w .* f);
+    Ddiff = -(C_pol .^ 2) * w;
+    res = N_pol / Ddiff;
+    r = @(zz) aaa_eval(zz, z, f, w);
+end
+
+function r = aaa_eval(zz, z, f, w)
+    zv = zz(:);
+    CC = 1 ./ bsxfun(@minus, zv, z.');
+    num = CC * (w .* f);
+    den = CC * w;
+    r = num ./ den;
+    bad = find(isnan(r) | isinf(r));
+    for k = 1:length(bad)
+        idx = find(zv(bad(k)) == z, 1);
+        if ~isempty(idx)
+            r(bad(k)) = f(idx);
+        end
+    end
+    r = reshape(r, size(zz));
+end

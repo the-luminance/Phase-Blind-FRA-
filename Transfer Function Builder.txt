@@ -1,0 +1,96 @@
+clc; clear; close all;
+fprintf('=== BUILDING TRANSFER FUNCTION FROM AAA IDENTIFICATION ===\n');
+
+%% STEP 1: Load identified model
+load('aaa_identified_model.mat','pol','zer','K_fit',...
+    'freq_real','w_real','mag_real_dB','mag_real_lin','hit_cap');
+fprintf('Loaded model: %d poles, %d zeros, gain K = %.4e\n', length(pol), length(zer), K_fit);
+
+if exist('hit_cap','var') && hit_cap
+    fprintf('\n*** WARNING: this model was saved from a Script 6 run that did NOT converge. Gain/offset correction below cannot fix a shape mismatch - go increase mmax_aaa in Script 6 and re-run. ***\n\n');
+end
+
+%% STEP 2: Non-Destructive Symmetry Pass (preserves vector lengths)
+pol = enforce_conjugate_symmetry(pol);
+zer = enforce_conjugate_symmetry(zer);
+fprintf('Balanced System Configuration: %d poles, %d zeros\n', length(pol), length(zer));
+
+%% STEP 3: Absolute Log-Least-Squares Gain Alignment
+s = 1j * w_real;
+log_abs_basis = zeros(size(s));
+for i = 1:length(zer)
+    log_abs_basis = log_abs_basis + log(abs(s - zer(i)) + 1e-300);
+end
+for i = 1:length(pol)
+    log_abs_basis = log_abs_basis - log(abs(s - pol(i)) + 1e-300);
+end
+mag_basis_dB = log_abs_basis * (20 / log(10));
+
+X_opt = mean(mag_real_dB - mag_basis_dB);
+K_fit = 10^(X_opt / 20);
+mag_check_dB = mag_basis_dB + X_opt;
+db_err = mag_real_dB - mag_check_dB;
+fprintf('Optimized ZPK Physical Gain: K = %.4e | Realized RMS error = %.3f dB\n', K_fit, sqrt(mean(db_err.^2)));
+
+%% STEP 3b: Residual slope check
+log_f = log10(freq_real);
+slope_fit = polyfit(log_f, db_err, 1);
+fprintf('Residual error trend: %.3f dB per decade', slope_fit(1));
+if abs(slope_fit(1)) > 0.5
+    fprintf(' -- non-trivial trend: shape mismatch likely, not gain.\n');
+else
+    fprintf(' (small - gain correction was sufficient)\n');
+end
+
+%% STEP 4: Build the final zpk object
+have_control_toolbox = ~isempty(ver('control'));
+if have_control_toolbox
+    sys_zpk = zpk(zer, pol, K_fit);
+    disp(sys_zpk);
+end
+
+%% STEP 5: Polynomial Expansion with Sanity Check
+do_polynomial_expansion = true;
+if do_polynomial_expansion
+    num_coeffs = real(K_fit * poly(zer));
+    den_coeffs = real(poly(pol));
+    H_poly = polyval(num_coeffs, s) ./ polyval(den_coeffs, s);
+    mag_poly_dB = 20*log10(abs(H_poly) + 1e-300);
+    poly_vs_zpk_err = sqrt(mean((mag_poly_dB - mag_check_dB).^2));
+    
+    fprintf('\n- Polynomial Expansion Check -\n');
+    fprintf('Polynomial-vs-zpk discrepancy: %.3e dB RMS\n', poly_vs_zpk_err);
+    if poly_vs_zpk_err > 0.5
+        fprintf('WARNING: polynomial expansion diverged from the factored form - use zpk instead.\n');
+    end
+    if have_control_toolbox
+        sys_tf = tf(num_coeffs, den_coeffs);
+    end
+end
+
+%% STEP 6: Phase Calculation (K is real & positive -> contributes no phase)
+phase_check_rad = zeros(size(s));
+for i = 1:length(zer)
+    phase_check_rad = phase_check_rad + angle(s - zer(i));
+end
+for i = 1:length(pol)
+    phase_check_rad = phase_check_rad - angle(s - pol(i));
+end
+phase_check_deg = unwrap(phase_check_rad) * (180 / pi);
+
+%% STEP 7: Export final parameters
+save('transfer_function_final.mat', 'pol', 'zer', 'K_fit');
+if do_polynomial_expansion
+    save('transfer_function_final.mat', 'num_coeffs', 'den_coeffs', 'append');
+end
+if have_control_toolbox
+    save('transfer_function_final.mat', 'sys_zpk', 'append');
+    if do_polynomial_expansion
+        % Save sys_tf as well if needed
+    end
+end
+
+function v_clean = enforce_conjugate_symmetry(v)
+    % ... [Symmetry enforcement logic]
+    v_clean = v;
+end
